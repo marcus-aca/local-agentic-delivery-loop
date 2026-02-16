@@ -1,0 +1,19 @@
+# Markdown artifacts
+*.md
+
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment files
+.env
+.venv/
+venv/
+
+# Runtime artifacts
+*.log
+*.tmp
+
+# OS/editor noise
+.DS_Store
