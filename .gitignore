@@ -17,3 +17,9 @@ venv/
 
 # OS/editor noise
 .DS_Store
+
+# Terraform working files
+.terraform/
+*.tfstate
+*.tfstate.*
+infra/terraform.tfvars
