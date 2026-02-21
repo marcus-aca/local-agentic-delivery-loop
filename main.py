@@ -1,4 +1,5 @@
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -73,6 +74,35 @@ CODE_LIKE_PATTERNS = [
 ]
 
 ANSI_ESCAPE_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+SENSITIVE_PATTERNS = [
+    ("AWS access key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("Private key block", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+    ("Generic secret assignment", re.compile(r"(?i)\b(api[_-]?key|token|secret|password)\b\s*[:=]\s*['\"][^'\"]{8,}['\"]")),
+]
+
+SENSITIVE_SCAN_INCLUDE_GLOBS = (
+    "*.py",
+    "*.sh",
+    "*.md",
+    "*.yaml",
+    "*.yml",
+    "*.json",
+    "*.tf",
+    "*.tfvars",
+    "*.env",
+    "*.txt",
+)
+
+SENSITIVE_SCAN_EXCLUDED_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+}
 
 
 def should_print_line(line: str, suppress_noise: bool, suppress_prompt_echo: bool) -> bool:
@@ -475,6 +505,7 @@ Collaboration files (in current working directory):
 - development.md (developer current state snapshot)
 - review.md (review current state snapshot)
 - test_results.md (test current state snapshot)
+- compliance.md (compliance current state snapshot)
 
 Rules:
 - Keep plan language concrete: each step should name deliverable + validation intent.
@@ -502,6 +533,7 @@ Collaboration files (in current working directory):
 - development.md
 - review.md
 - test_results.md
+- compliance.md
 
 Rules:
 - State decision rationale and key tradeoffs (why this, not alternatives) where choices exist.
@@ -530,6 +562,7 @@ Collaboration files:
 - development.md
 - review.md
 - test_results.md
+- compliance.md
 
 Rules:
 - Prefer minimal, targeted edits over broad refactors.
@@ -566,6 +599,7 @@ Collaboration files:
 - development.md
 - review.md
 - test_results.md
+- compliance.md
 
 Rules:
 - Prioritize concrete defects and risks over stylistic preferences.
@@ -595,6 +629,7 @@ Collaboration files:
 - development.md
 - review.md
 - test_results.md
+- compliance.md
 
 Rules:
 - Fail if critical verification cannot run, unless a justified temporary exception is documented.
@@ -607,6 +642,35 @@ Rules:
   TEST_STATUS: PASS; REPLAN_REQUIRED: YES|NO
   or
   TEST_STATUS: FAIL; REPLAN_REQUIRED: YES|NO
+"""
+
+
+COMPLIANCE_SYSTEM = """
+You are the COMPLIANCE role. Own policy conformance and final safeguard gate.
+
+Responsibilities:
+1) Validate coding style, compliance, and safeguard adherence using AGENTS.md and agent_policies.md.
+2) Confirm reviewer/tester evidence quality and identify any policy breaches.
+3) Write compliance.md as the current-state compliance snapshot with actionable remediation.
+
+Collaboration files:
+- AGENTS.md
+- agent_policies.md
+- plan.md
+- architecture.md
+- development.md
+- review.md
+- test_results.md
+- compliance.md
+
+Rules:
+- Prioritize concrete policy violations and security/compliance risk over style opinions.
+- Cite unmet policy clauses and impacted files/components.
+- If high-level plan/architecture changes are needed, set REPLAN_REQUIRED: YES.
+- Keep compliance.md as current state, not a historical log.
+- Return plain text only.
+- End your response with exactly one line:
+  COMPLIANCE_STATUS: APPROVED|VIOLATIONS; SAFEGUARD_STATUS: PASS|FAIL; REPLAN_REQUIRED: YES|NO
 """
 
 
@@ -652,6 +716,17 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Require successful Terraform apply evidence before completion (default: enabled)",
+    )
+    parser.add_argument(
+        "--policy-file",
+        default="agent_policies.md",
+        help="Policy pack markdown file in workspace (default: agent_policies.md)",
+    )
+    parser.add_argument(
+        "--strict-policy-gates",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Block completion when compliance/safeguard gates fail (default: enabled)",
     )
     return parser.parse_args()
 
@@ -774,17 +849,80 @@ def ensure_inputs(args: argparse.Namespace, cwd: Path) -> tuple[str, str, str]:
     return idea, guidelines, role_preferences
 
 
-def with_role_preferences(system_prompt: str, role_preferences: str) -> str:
-    if not role_preferences.strip():
-        return system_prompt
-    return (
-        f"{system_prompt.strip()}\n\n"
-        "Global role preferences (from brief file):\n"
-        f"{role_preferences.strip()}\n\n"
-        "Instruction:\n"
-        "- Treat these preferences as high-priority constraints for this role.\n"
-        "- If any preference conflicts with feasibility or safety, explain the conflict and propose a compatible alternative.\n"
+def load_governance_context(cwd: Path, policy_file: str) -> tuple[str, str, Path, Path]:
+    policy_path = (
+        (cwd / policy_file).resolve()
+        if not Path(policy_file).is_absolute()
+        else Path(policy_file).resolve()
     )
+    agents_path = cwd / "AGENTS.md"
+    agents_text = ""
+    policy_text = ""
+    if agents_path.exists():
+        agents_text = agents_path.read_text(encoding="utf-8").strip()
+    if policy_path.exists():
+        policy_text = policy_path.read_text(encoding="utf-8").strip()
+    return agents_text, policy_text, agents_path, policy_path
+
+
+def with_governance_contract(
+    system_prompt: str,
+    role_preferences: str,
+    agents_text: str,
+    policy_text: str = "",
+) -> str:
+    out = system_prompt.strip()
+    if role_preferences.strip():
+        out += (
+            "\n\nGlobal role preferences (from brief file):\n"
+            + role_preferences.strip()
+            + "\n\nInstruction:\n"
+            "- Treat these preferences as high-priority constraints for this role.\n"
+            "- If any preference conflicts with feasibility or safety, explain the conflict and propose a compatible alternative.\n"
+        )
+    if agents_text.strip():
+        out += (
+            "\n\nProduction governance contract (AGENTS.md):\n"
+            + agents_text.strip()
+            + "\n\nInstruction:\n"
+            "- Apply these coding style, compliance, and safeguard requirements in this role.\n"
+            "- Explicitly call out policy conflicts and set REPLAN_REQUIRED: YES when conflicts are structural.\n"
+        )
+    if policy_text.strip():
+        out += (
+            "\n\nCompliance policy pack:\n"
+            + policy_text.strip()
+            + "\n\nInstruction:\n"
+            "- Apply these coding style, compliance, and safeguard requirements in this role.\n"
+            "- Explicitly call out policy conflicts and set REPLAN_REQUIRED: YES when conflicts are structural.\n"
+        )
+    return out
+
+
+def detect_sensitive_findings(cwd: Path, max_file_bytes: int = 512 * 1024) -> list[str]:
+    findings: list[str] = []
+    for path in cwd.rglob("*"):
+        if not path.is_file():
+            continue
+        if any(part in SENSITIVE_SCAN_EXCLUDED_DIRS for part in path.parts):
+            continue
+        rel = path.relative_to(cwd)
+        rel_name = str(rel)
+        if not any(fnmatch.fnmatch(rel_name, pattern) for pattern in SENSITIVE_SCAN_INCLUDE_GLOBS):
+            continue
+        try:
+            if path.stat().st_size > max_file_bytes:
+                continue
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            for label, pattern in SENSITIVE_PATTERNS:
+                if pattern.search(line):
+                    findings.append(f"{rel_name}:{line_no} ({label})")
+                    if len(findings) >= 25:
+                        return findings
+    return findings
 
 
 def extract_marker(text: str, marker_name: str, allowed: list[str], default: str) -> str:
@@ -1311,6 +1449,7 @@ def ensure_shared_files(
         "development": cwd / "development.md",
         "review": cwd / "review.md",
         "test_results": cwd / "test_results.md",
+        "compliance": cwd / "compliance.md",
         "decisions_log": cwd / "decisions_log.md",
         "workflow_state": cwd / "workflow_state.json",
     }
@@ -1342,6 +1481,11 @@ def ensure_shared_files(
             "# Test State\n\n(To be maintained as current state by tester)\n",
             encoding="utf-8",
         )
+    if not files["compliance"].exists():
+        files["compliance"].write_text(
+            "# Compliance State\n\n(To be maintained as current state by compliance role)\n",
+            encoding="utf-8",
+        )
     if not files["decisions_log"].exists():
         files["decisions_log"].write_text(
             "# Agent Decisions and Handoffs (Current)\n\n(no events yet)\n## Events\n",
@@ -1352,6 +1496,7 @@ def ensure_shared_files(
     normalize_state_snapshot(files["development"], "Development State")
     normalize_state_snapshot(files["review"], "Review State")
     normalize_state_snapshot(files["test_results"], "Test State")
+    normalize_state_snapshot(files["compliance"], "Compliance State")
     return files
 
 
@@ -1442,6 +1587,8 @@ def write_workflow_state(
     dev_status: str,
     review_status: str,
     test_status: str,
+    compliance_status: str = "",
+    safeguard_status: str = "",
 ) -> None:
     state = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -1451,6 +1598,8 @@ def write_workflow_state(
         "dev_status": dev_status,
         "review_status": review_status,
         "test_status": test_status,
+        "compliance_status": compliance_status,
+        "safeguard_status": safeguard_status,
     }
     path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
 
@@ -1458,7 +1607,7 @@ def write_workflow_state(
 def infer_resume_role_from_state(state_path: Path, current_step: str) -> str:
     state = read_workflow_state(state_path)
     next_role = state.get("next_role", "DEVELOPER").upper()
-    if next_role not in {"REVIEWER", "TESTER"}:
+    if next_role not in {"REVIEWER", "TESTER", "COMPLIANCE"}:
         return "DEVELOPER"
     state_step = state.get("current_step", "")
     if state_step != current_step:
@@ -1466,6 +1615,7 @@ def infer_resume_role_from_state(state_path: Path, current_step: str) -> str:
 
     dev_status = state.get("dev_status", "").upper()
     review_status = state.get("review_status", "").upper()
+    test_status = state.get("test_status", "").upper()
     if next_role == "REVIEWER":
         if dev_status in {"READY_FOR_REVIEW", "COMPLETE"}:
             return "REVIEWER"
@@ -1473,6 +1623,14 @@ def infer_resume_role_from_state(state_path: Path, current_step: str) -> str:
     if next_role == "TESTER":
         if dev_status in {"READY_FOR_REVIEW", "COMPLETE"} and review_status == "APPROVED":
             return "TESTER"
+        return "DEVELOPER"
+    if next_role == "COMPLIANCE":
+        if (
+            dev_status in {"READY_FOR_REVIEW", "COMPLETE"}
+            and review_status == "APPROVED"
+            and test_status == "PASS"
+        ):
+            return "COMPLIANCE"
         return "DEVELOPER"
     return "DEVELOPER"
 
@@ -1488,6 +1646,7 @@ def run_planner_architect(
     reason: str,
     cycle: int,
     triggered_by: str,
+    agents_text: str,
     cli_tool: str = "codex",
 ) -> tuple[str, str]:
     append_decision(
@@ -1515,7 +1674,11 @@ If change requests are present, update the implementation plan to address them.
 Include a short human-readable summary in your plain-text response.
 """
     planner_out = run_agent_cli(
-        "PLANNER", with_role_preferences(PLANNER_SYSTEM, role_preferences), planner_task, cwd, cli_tool
+        "PLANNER",
+        with_governance_contract(PLANNER_SYSTEM, role_preferences, agents_text),
+        planner_task,
+        cwd,
+        cli_tool,
     )
     planner_status = extract_marker(planner_out, "PLAN_STATUS", ["READY"], "READY")
     append_decision(
@@ -1545,7 +1708,7 @@ Include a concise human-readable summary in your plain-text response.
 """
     architect_out = run_agent_cli(
         "ARCHITECT",
-        with_role_preferences(ARCHITECT_SYSTEM, role_preferences),
+        with_governance_contract(ARCHITECT_SYSTEM, role_preferences, agents_text),
         architect_task,
         cwd,
         cli_tool,
@@ -1562,6 +1725,7 @@ def main() -> int:
     args = parse_args()
     cwd = Path.cwd().resolve()
     idea, guidelines, role_preferences = ensure_inputs(args, cwd)
+    agents_text, policy_text, agents_path, policy_path = load_governance_context(cwd, args.policy_file)
     changes_path, change_request = read_changes_request(cwd, args.changes_file)
 
     shared = ensure_shared_files(cwd, idea, guidelines, role_preferences)
@@ -1585,6 +1749,14 @@ def main() -> int:
     print(
         "Enforce Terraform apply: "
         + ("enabled" if args.enforce_apply else "disabled")
+    )
+    print(
+        "Strict policy gates: "
+        + ("enabled" if args.strict_policy_gates else "disabled")
+    )
+    print(
+        f"Governance files: AGENTS.md={'present' if agents_path.exists() else 'missing'}, "
+        + f"{policy_path.name}={'present' if policy_path.exists() else 'missing'}"
     )
     print(f"Working directory: {cwd}")
     print("Knowledge files:")
@@ -1614,6 +1786,7 @@ def main() -> int:
             reason=reason,
             cycle=0,
             triggered_by="SYSTEM",
+            agents_text=agents_text,
             cli_tool=args.cli,
         )
 
@@ -1636,7 +1809,9 @@ def main() -> int:
     dev_status = "IN_PROGRESS"
     review_status = "CHANGES_REQUIRED"
     test_status = "FAIL"
-    last_gate_signature: tuple[str, str, str, str, bool] | None = None
+    compliance_status = "VIOLATIONS"
+    safeguard_status = "FAIL"
+    last_gate_signature: tuple[str, str, str, str, str, str, bool] | None = None
     stagnation_count = 0
 
     def record_stagnation_and_maybe_stop(
@@ -1645,6 +1820,8 @@ def main() -> int:
         dev_status: str,
         review_status: str,
         test_status: str,
+        compliance_status: str,
+        safeguard_status: str,
         apply_ok: bool,
     ) -> bool:
         nonlocal last_gate_signature, stagnation_count
@@ -1653,6 +1830,8 @@ def main() -> int:
             dev_status,
             review_status,
             test_status,
+            compliance_status,
+            safeguard_status,
             apply_ok,
         )
         if current_gate_signature == last_gate_signature:
@@ -1665,7 +1844,8 @@ def main() -> int:
             reason = (
                 "Repeated identical gate outcomes without step progress; stopping to avoid loop. "
                 f"step={current_step}; dev={dev_status}; review={review_status}; "
-                f"test={test_status}; apply_ok={str(apply_ok).upper()}; "
+                f"test={test_status}; compliance={compliance_status}; safeguards={safeguard_status}; "
+                f"apply_ok={str(apply_ok).upper()}; "
                 f"stagnation_cycles={stagnation_count}"
             )
             print(f"[GATE] {reason}")
@@ -1699,9 +1879,12 @@ def main() -> int:
         developer_out = ""
         reviewer_out = ""
         tester_out = ""
+        compliance_out = ""
         apply_ok = False
 
         if next_role == "DEVELOPER":
+            compliance_status = "VIOLATIONS"
+            safeguard_status = "FAIL"
             developer_task = f"""
 Cycle {cycle}.
 
@@ -1713,6 +1896,7 @@ Read and follow:
 - architecture.md
 - review.md
 - test_results.md
+- compliance.md
 
 Active change request (from {changes_path}):
 {change_request if change_request else "(none)"}
@@ -1734,7 +1918,7 @@ Return plain text summary and a DEV_STATUS marker.
 """
             developer_out = run_agent_cli(
                 "DEVELOPER",
-                with_role_preferences(DEVELOPER_SYSTEM, role_preferences),
+                with_governance_contract(DEVELOPER_SYSTEM, role_preferences, agents_text),
                 developer_task,
                 cwd,
                 args.cli,
@@ -1767,6 +1951,7 @@ Return plain text summary and a DEV_STATUS marker.
                     reason=reason,
                     cycle=cycle,
                     triggered_by="DEVELOPER",
+                    agents_text=agents_text,
                     cli_tool=args.cli,
                 )
                 next_role = "DEVELOPER"
@@ -1780,7 +1965,7 @@ Return plain text summary and a DEV_STATUS marker.
                     test_status=test_status,
                 )
                 if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, apply_ok
+                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
                 ):
                     break
                 continue
@@ -1800,7 +1985,7 @@ Return plain text summary and a DEV_STATUS marker.
                     test_status=test_status,
                 )
                 if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, apply_ok
+                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
                 ):
                     break
                 continue
@@ -1833,6 +2018,15 @@ Return plain text summary and a DEV_STATUS marker.
                 shared["decisions_log"],
                 f"cycle={cycle} | resume | handoff=REVIEWER->TESTER",
             )
+        elif next_role == "COMPLIANCE":
+            print("[RESUME] Skipping developer/reviewer/tester this cycle and resuming at compliance.")
+            dev_status = "READY_FOR_REVIEW"
+            review_status = "APPROVED"
+            test_status = "PASS"
+            append_decision(
+                shared["decisions_log"],
+                f"cycle={cycle} | resume | handoff=TESTER->COMPLIANCE",
+            )
 
         if next_role in {"REVIEWER"}:
             reviewer_task = f"""
@@ -1845,6 +2039,7 @@ Read:
 - plan.md
 - architecture.md
 - development.md
+- compliance.md
 
 Active change request (from {changes_path}):
 {change_request if change_request else "(none)"}
@@ -1860,7 +2055,7 @@ Return plain text summary and REVIEW_STATUS marker.
 """
             reviewer_out = run_agent_cli(
                 "REVIEWER",
-                with_role_preferences(REVIEWER_SYSTEM, role_preferences),
+                with_governance_contract(REVIEWER_SYSTEM, role_preferences, agents_text),
                 reviewer_task,
                 cwd,
                 args.cli,
@@ -1893,6 +2088,7 @@ Return plain text summary and REVIEW_STATUS marker.
                     reason=reason,
                     cycle=cycle,
                     triggered_by="REVIEWER",
+                    agents_text=agents_text,
                     cli_tool=args.cli,
                 )
                 next_role = "DEVELOPER"
@@ -1906,7 +2102,7 @@ Return plain text summary and REVIEW_STATUS marker.
                     test_status=test_status,
                 )
                 if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, apply_ok
+                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
                 ):
                     break
                 continue
@@ -1931,7 +2127,7 @@ Return plain text summary and REVIEW_STATUS marker.
                     test_status=test_status,
                 )
                 if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, apply_ok
+                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
                 ):
                     break
                 continue
@@ -1962,6 +2158,7 @@ Read:
 - architecture.md
 - development.md
 - review.md
+- compliance.md
 
 Active change request (from {changes_path}):
 {change_request if change_request else "(none)"}
@@ -1980,7 +2177,7 @@ Return plain text summary and TEST_STATUS marker.
 """
             tester_out = run_agent_cli(
                 "TESTER",
-                with_role_preferences(TESTER_SYSTEM, role_preferences),
+                with_governance_contract(TESTER_SYSTEM, role_preferences, agents_text),
                 tester_task,
                 cwd,
                 args.cli,
@@ -2007,6 +2204,7 @@ Return plain text summary and TEST_STATUS marker.
                     reason=reason,
                     cycle=cycle,
                     triggered_by="TESTER",
+                    agents_text=agents_text,
                     cli_tool=args.cli,
                 )
                 next_role = "DEVELOPER"
@@ -2018,9 +2216,11 @@ Return plain text summary and TEST_STATUS marker.
                     dev_status=dev_status,
                     review_status=review_status,
                     test_status=test_status,
+                    compliance_status=compliance_status,
+                    safeguard_status=safeguard_status,
                 )
                 if record_stagnation_and_maybe_stop(
-                    cycle, current_step, dev_status, review_status, test_status, apply_ok
+                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
                 ):
                     break
                 continue
@@ -2039,21 +2239,146 @@ Return plain text summary and TEST_STATUS marker.
                     f"cycle={cycle} | gate=APPLY_ENFORCEMENT | result=FAIL | handoff=TESTER->DEVELOPER",
                 )
             write_state_snapshot(shared["test_results"], "Test State", tester_out)
+            if test_status == "PASS":
+                append_decision(
+                    shared["decisions_log"],
+                    f"cycle={cycle} | handoff=TESTER->COMPLIANCE",
+                )
+                next_role = "COMPLIANCE"
+                write_workflow_state(
+                    shared["workflow_state"],
+                    cycle=cycle,
+                    current_step=current_step,
+                    next_role=next_role,
+                    dev_status=dev_status,
+                    review_status=review_status,
+                    test_status=test_status,
+                    compliance_status=compliance_status,
+                    safeguard_status=safeguard_status,
+                )
+            else:
+                next_role = "DEVELOPER"
+
+        if next_role == "COMPLIANCE":
+            compliance_task = f"""
+Compliance cycle {cycle}.
+
+Current implementation step (from plan checklist):
+{current_step}
+
+Read:
+- AGENTS.md
+- {policy_path.name}
+- plan.md
+- architecture.md
+- development.md
+- review.md
+- test_results.md
+
+Active change request (from {changes_path}):
+{change_request if change_request else "(none)"}
+
+Repository path:
+{cwd}
+
+Assess coding-style consistency, compliance obligations, and safeguard coverage.
+Ensure reviewer and tester evidence is sufficient for production confidence.
+Write compliance.md with blocking and non-blocking policy findings.
+If high-level plan/architecture changes are needed, set REPLAN_REQUIRED: YES.
+Return plain text summary and compliance markers.
+"""
+            compliance_out = run_agent_cli(
+                "COMPLIANCE",
+                with_governance_contract(COMPLIANCE_SYSTEM, role_preferences, agents_text, policy_text),
+                compliance_task,
+                cwd,
+                args.cli,
+            )
+            compliance_status = extract_marker(
+                compliance_out,
+                "COMPLIANCE_STATUS",
+                ["APPROVED", "VIOLATIONS"],
+                "VIOLATIONS",
+            )
+            safeguard_status = extract_marker(
+                compliance_out,
+                "SAFEGUARD_STATUS",
+                ["PASS", "FAIL"],
+                "FAIL",
+            )
+            compliance_replan = extract_yes_no_marker(compliance_out, "REPLAN_REQUIRED", default="NO")
+
+            secret_findings = detect_sensitive_findings(cwd)
+            if secret_findings:
+                compliance_status = "VIOLATIONS"
+                safeguard_status = "FAIL"
+                evidence = "Sensitive-content scan findings:\n- " + "\n- ".join(secret_findings)
+                compliance_out = compliance_out.strip() + "\n\n" + evidence
+                append_decision(
+                    shared["decisions_log"],
+                    f"cycle={cycle} | gate=SENSITIVE_SCAN | result=FAIL | findings={len(secret_findings)}",
+                )
+            write_state_snapshot(shared["compliance"], "Compliance State", compliance_out)
+            append_decision(
+                shared["decisions_log"],
+                f"cycle={cycle} | role=COMPLIANCE | compliance_status={compliance_status} | safeguard_status={safeguard_status} | replan_required={compliance_replan}",
+            )
+            if compliance_replan == "YES" or should_replan(compliance_out):
+                reason = (
+                    f"Compliance cycle {cycle} requested high-level planning/architecture change."
+                )
+                print(f"[GATE] {reason}")
+                run_planner_architect(
+                    cwd=cwd,
+                    idea=idea,
+                    guidelines=guidelines,
+                    role_preferences=role_preferences,
+                    changes_path=changes_path,
+                    change_request=change_request,
+                    shared=shared,
+                    reason=reason,
+                    cycle=cycle,
+                    triggered_by="COMPLIANCE",
+                    agents_text=agents_text,
+                    cli_tool=args.cli,
+                )
+                next_role = "DEVELOPER"
+                write_workflow_state(
+                    shared["workflow_state"],
+                    cycle=cycle,
+                    current_step=current_step,
+                    next_role=next_role,
+                    dev_status=dev_status,
+                    review_status=review_status,
+                    test_status=test_status,
+                    compliance_status=compliance_status,
+                    safeguard_status=safeguard_status,
+                )
+                if record_stagnation_and_maybe_stop(
+                    cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
+                ):
+                    break
+                continue
+
+        policy_gate_ok = compliance_status == "APPROVED" and safeguard_status == "PASS"
+        if not args.strict_policy_gates and (compliance_status or safeguard_status):
+            policy_gate_ok = True
 
         done = (
             review_status == "APPROVED"
             and test_status == "PASS"
             and dev_status in {"READY_FOR_REVIEW", "COMPLETE"}
+            and policy_gate_ok
         )
 
         print(
             f"Cycle {cycle} gate -> dev={dev_status}, review={review_status}, "
-            f"test={test_status}, apply_ok={apply_ok}"
+            f"test={test_status}, compliance={compliance_status}, safeguards={safeguard_status}, apply_ok={apply_ok}"
         )
-        next_handoff = "COMPLETE" if done else "TESTER->DEVELOPER"
+        next_handoff = "COMPLETE" if done else "COMPLIANCE->DEVELOPER"
         append_decision(
             shared["decisions_log"],
-            f"cycle={cycle} | gate=DELIVERY | done={str(done).upper()} | apply_ok={str(apply_ok).upper()} | handoff={next_handoff}",
+            f"cycle={cycle} | gate=DELIVERY | done={str(done).upper()} | policy_gate_ok={str(policy_gate_ok).upper()} | apply_ok={str(apply_ok).upper()} | handoff={next_handoff}",
         )
 
         if done:
@@ -2095,6 +2420,8 @@ Return plain text summary and TEST_STATUS marker.
                     dev_status=dev_status,
                     review_status=review_status,
                     test_status=test_status,
+                    compliance_status=compliance_status,
+                    safeguard_status=safeguard_status,
                 )
                 break
             print("Step validated. Proceeding to next plan step.")
@@ -2111,6 +2438,8 @@ Return plain text summary and TEST_STATUS marker.
                 dev_status=dev_status,
                 review_status=review_status,
                 test_status=test_status,
+                compliance_status=compliance_status,
+                safeguard_status=safeguard_status,
             )
             continue
 
@@ -2123,9 +2452,11 @@ Return plain text summary and TEST_STATUS marker.
             dev_status=dev_status,
             review_status=review_status,
             test_status=test_status,
+            compliance_status=compliance_status,
+            safeguard_status=safeguard_status,
         )
         if record_stagnation_and_maybe_stop(
-            cycle, current_step, dev_status, review_status, test_status, apply_ok
+            cycle, current_step, dev_status, review_status, test_status, compliance_status, safeguard_status, apply_ok
         ):
             break
     else:

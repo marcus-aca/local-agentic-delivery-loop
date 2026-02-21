@@ -27,6 +27,7 @@ Options:
 Notes:
   - --brief-file points to a markdown brief with ## Idea and ## Guidelines sections.
   - Optional: add ## Role Preferences (or ## Project Structure Preferences) to inject shared constraints into every role system prompt.
+  - Policy controls can be passed through to main.py: --policy-file <path> and --[no-]strict-policy-gates.
   - Subsequent change requests can be put in changes.md (or pass --changes-file <path>).
   - Optional extra CLI flags can be supplied via AGENT_CLI_FLAGS_EXTRA.
 EOF

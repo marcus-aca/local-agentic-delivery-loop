@@ -13,6 +13,7 @@ The approach is a controlled multi-agent workflow with explicit responsibilities
 - `DEVELOPER`: implements one active checklist step at a time.
 - `REVIEWER`: performs quality gate review.
 - `TESTER`: runs verification and emits pass/fail status.
+- `COMPLIANCE`: validates policy/style/safeguard conformance before completion.
 
 The orchestrator is not just "chat with an LLM". It enforces:
 
@@ -78,16 +79,24 @@ The current design includes several practical optimizations to reduce waste and 
   - loop/progress-message repetition detection
 - Delivery guardrail:
   - optional Terraform apply enforcement (`--enforce-apply` default enabled).
+- Governance and safeguard guardrails:
+  - `AGENTS.md` injected into all role prompts.
+  - `agent_policies.md` injected into `COMPLIANCE` role prompt only.
+  - dedicated compliance gate (`COMPLIANCE_STATUS`, `SAFEGUARD_STATUS` markers).
+  - deterministic sensitive-content scan gate before step completion.
 
 ## Workflow Artifacts
 
 Primary collaboration files in the working directory:
 
+- `AGENTS.md`
+- `agent_policies.md`
 - `plan.md`
 - `architecture.md`
 - `development.md`
 - `review.md`
 - `test_results.md`
+- `compliance.md`
 - `decisions_log.md` (latest decision snapshot)
 - `workflow_state.json`
 
@@ -120,6 +129,18 @@ Optional change request input:
 
 ```bash
 ./run_agentic.sh --brief-file ./brief.md --changes-file ./changes.md
+```
+
+Strict policy gate controls:
+
+```bash
+./run_agentic.sh --brief-file ./brief.md --policy-file ./agent_policies.md --strict-policy-gates
+```
+
+Relax policy blocking (compliance findings are still reported but do not block completion):
+
+```bash
+./run_agentic.sh --brief-file ./brief.md --no-strict-policy-gates
 ```
 
 ## Why This Shape Works
